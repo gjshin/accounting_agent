@@ -37,7 +37,7 @@ docx = ensure("docx", "python-docx")
 from docx.enum.text import WD_BREAK  # noqa: E402
 from docx.oxml import OxmlElement  # noqa: E402
 from docx.oxml.ns import qn  # noqa: E402
-from docx.shared import Pt, RGBColor  # noqa: E402
+from docx.shared import Mm, Pt, RGBColor  # noqa: E402
 
 
 # Word는 XML 하위 요소의 순서를 엄격히 따진다. 음영(shd) 뒤에 와야 하는 요소들.
@@ -113,6 +113,9 @@ def build_reference(path: Path, header_text: str) -> None:
         bt.paragraph_format.right_indent = Pt(6)
         shade(bt.element.get_or_add_pPr(), "F2F2F2", PPR_AFTER_SHD)
     section = d.sections[0]
+    section.page_width, section.page_height = Mm(210), Mm(297)
+    section.left_margin = section.right_margin = Mm(20)
+    section.top_margin, section.bottom_margin = Mm(22), Mm(20)
     hp = section.header.paragraphs[0]
     hp.text = ""
     run = hp.add_run(header_text)
@@ -123,8 +126,48 @@ def build_reference(path: Path, header_text: str) -> None:
     d.save(str(path))
 
 
+def visual_len(text: str) -> int:
+    # 한글·한자 등 전각 문자는 영문·숫자의 약 두 배 폭을 차지한다.
+    return sum(2 if ord(ch) >= 0x1100 else 1 for ch in text)
+
+
+def fit_columns(d, table) -> None:
+    """열마다 가장 긴 내용에 비례해 너비를 나눈다(최소·최대 비중 제한)."""
+    sec = d.sections[0]
+    if sec.page_width and sec.left_margin is not None and sec.right_margin is not None:
+        usable = sec.page_width - sec.left_margin - sec.right_margin
+    else:
+        usable = Mm(210 - 2 * 20)
+    ncols = len(table.columns)
+    # 머리행 글자가 한 줄에 들어갈 최소 너비를 먼저 주고, 남는 너비를 내용 길이에 비례해 나눈다.
+    half_char = Pt(5.5)
+    floors, weights = [], []
+    for c in range(ncols):
+        longest = max((visual_len(row.cells[c].text) for row in table.rows if c < len(row.cells)), default=1)
+        header = visual_len(table.rows[0].cells[c].text) if c < len(table.rows[0].cells) else 0
+        floors.append(half_char * (max(header, 4) + 2))
+        weights.append(min(longest, 80))
+    spare = max(usable - sum(floors), 0)
+    total = sum(weights) or 1
+    widths = [int(f + spare * w / total) for f, w in zip(floors, weights)]
+    tbl_pr = table._tbl.tblPr
+    layout = tbl_pr.find(qn("w:tblLayout"))
+    if layout is None:
+        layout = OxmlElement("w:tblLayout")
+        tbl_pr.insert_element_before(layout, "w:tblCellMar", "w:tblLook", "w:tblCaption",
+                                     "w:tblDescription", "w:tblPrChange")
+    layout.set(qn("w:type"), "fixed")
+    grid = table._tbl.tblGrid
+    for col, w in zip(grid.findall(qn("w:gridCol")), widths):
+        col.set(qn("w:w"), str(int(w / 635)))  # EMU → twip
+    for row in table.rows:
+        for cell, w in zip(row.cells, widths):
+            cell.width = w
+
+
 def style_tables(d) -> None:
     for table in d.tables:
+        fit_columns(d, table)
         tbl_pr = table._tbl.tblPr
         borders = OxmlElement("w:tblBorders")
         for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
@@ -152,6 +195,33 @@ def page_breaks(d) -> None:
             first_h1 = False
 
 
+BLOCK_START = re.compile(r"^\s*(?:[-*+]\s|\d+[.)]\s|\||>)")
+
+
+def block_kind(line: str) -> str:
+    stripped = line.lstrip()
+    if stripped.startswith("|"):
+        return "table"
+    if stripped.startswith(">"):
+        return "quote"
+    return "list"
+
+
+def separate_blocks(body: str) -> str:
+    """문단 바로 아래 붙은 목록·표·인용을 별도 블록으로 인식하도록 앞에 빈 줄을 넣는다."""
+    out, prev, in_code = [], "", False
+    for line in body.splitlines():
+        if line.startswith("```"):
+            in_code = not in_code
+        if (not in_code and BLOCK_START.match(line) and prev.strip()
+                and not (BLOCK_START.match(prev) and block_kind(prev) == block_kind(line))
+                and not prev.startswith("[^")):
+            out.append("")
+        out.append(line)
+        prev = line
+    return "\n".join(out) + "\n"
+
+
 def static_toc(body: str) -> str:
     lines = ['::: {custom-style="TOC Heading"}', "목차", ":::", ""]
     in_code = False
@@ -173,6 +243,7 @@ def convert(src: Path, dst: Path, header: str, subtitle: str, date: str) -> None
     body = text[m.end():] if m else text
     # 본문 '## 1. 요약' 같은 2단계 제목을 Word의 1단계 제목으로 올린다.
     body = re.sub(r"^(#{2,6})\s", lambda x: "#" * (len(x.group(1)) - 1) + " ", body, flags=re.MULTILINE)
+    body = separate_blocks(body)
     body = static_toc(body) + body
     with tempfile.TemporaryDirectory() as tmp:
         ref = USER_TEMPLATE
