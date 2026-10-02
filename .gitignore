@@ -1,1 +1,5 @@
 __pycache__/
+
+# 실제 질의·고객 건 보고서는 저장소에 올리지 않는다 (사용자에게 파일로만 전달)
+reports/*
+!reports/README.md
